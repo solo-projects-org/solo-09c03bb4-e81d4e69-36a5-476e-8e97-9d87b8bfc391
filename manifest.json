@@ -23,6 +23,20 @@
         "hydro/shared/quality.parquet",
         "hydro/shared/station_meta.parquet"
       ]
+    },
+    {
+      "snapshot_id": "snap-legacy-read",
+      "files": [
+        "legacy/hydro/2026-11-01/station_a.parquet",
+        "archive/2026-11-01/station_b.parquet"
+      ]
+    },
+    {
+      "snapshot_id": "snap-retired-aliases",
+      "files": [
+        "archive/2026-11-01/station_a.parquet",
+        "archive/links/station_b.parquet"
+      ]
     }
   ]
 }

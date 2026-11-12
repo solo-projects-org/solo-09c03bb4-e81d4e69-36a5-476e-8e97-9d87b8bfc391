@@ -106,6 +106,13 @@ class CleanupPreviewResponse(BaseModel):
     protected: list[str]
     protected_by_retained_snapshots: list[str]
     protected_by_active_exports: list[str]
+    protected_by_symlink_aliases: list[str] = Field(
+        ...,
+        description=(
+            "自身路径未被引用、但删除它会切断保留快照/未完成导出读取链"
+            "（目录软链接、多级文件软链接）的清单项"
+        ),
+    )
     active_exports: list[ActiveExport]
 
 
@@ -119,4 +126,11 @@ class CleanupResponse(BaseModel):
     protected: list[str]
     protected_by_retained_snapshots: list[str]
     protected_by_active_exports: list[str]
+    protected_by_symlink_aliases: list[str] = Field(
+        ...,
+        description=(
+            "自身路径未被引用、但删除它会切断保留快照/未完成导出读取链"
+            "（目录软链接、多级文件软链接）的清单项"
+        ),
+    )
     active_exports: list[ActiveExport]

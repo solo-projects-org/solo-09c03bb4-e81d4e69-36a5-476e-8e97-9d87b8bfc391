@@ -3,15 +3,30 @@
 In Docker Compose the data directory is a named volume.  Seeding happens once
 (marker file); afterwards deletions performed through the API survive service
 restarts.  `docker compose down -v` gets a fresh demo volume back.
+
+The sample tree contains symlinks (legacy read paths left over from the
+storage migration).  They are recreated as symlinks — copying their content
+instead would turn the alias demo into real duplicate files.
 """
 
 from __future__ import annotations
 
+import os
 import shutil
 from pathlib import Path
 
 
 MARKER_NAME = ".sample-data-seeded"
+
+
+def _seed_symlink(source: Path, target: Path) -> bool:
+    """Recreate ``source``'s symlink at ``target``; False if already there."""
+
+    if os.path.lexists(target):
+        return False
+    target.parent.mkdir(parents=True, exist_ok=True)
+    os.symlink(os.readlink(source), target)
+    return True
 
 
 def seed_sample_data(sample_dir: Path, data_dir: Path) -> int:
@@ -31,17 +46,28 @@ def seed_sample_data(sample_dir: Path, data_dir: Path) -> int:
 
     data_dir.mkdir(parents=True, exist_ok=True)
     copied = 0
-    for source in sorted(sample_dir.rglob("*")):
-        if not source.is_file():
-            continue
-        if source.name == MARKER_NAME:
-            continue
-        relative = source.relative_to(sample_dir)
-        target = data_dir / relative
-        target.parent.mkdir(parents=True, exist_ok=True)
-        if not target.exists():
-            shutil.copy2(source, target)
-            copied += 1
+    # followlinks=False: symlinked directories are reported in dirnames but
+    # not descended into, so every symlink is recreated exactly once.
+    for dirpath, dirnames, filenames in os.walk(sample_dir, followlinks=False):
+        target_dir = data_dir / Path(dirpath).relative_to(sample_dir)
+        target_dir.mkdir(parents=True, exist_ok=True)
+        for name in list(dirnames):
+            source = Path(dirpath) / name
+            if source.is_symlink():
+                dirnames.remove(name)
+                if _seed_symlink(source, target_dir / name):
+                    copied += 1
+        for name in filenames:
+            if name == MARKER_NAME:
+                continue
+            source = Path(dirpath) / name
+            target = target_dir / name
+            if source.is_symlink():
+                if _seed_symlink(source, target):
+                    copied += 1
+            elif not os.path.lexists(target):
+                shutil.copy2(source, target)
+                copied += 1
 
     marker.write_text(
         "Sample data was copied into this volume once. "

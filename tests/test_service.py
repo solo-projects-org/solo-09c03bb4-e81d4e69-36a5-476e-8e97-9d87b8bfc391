@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import threading
 import unittest
@@ -253,6 +254,249 @@ class CleanupServiceTests(unittest.TestCase):
         self.assertEqual(second["deleted"], [])
         self.assertEqual(second["already_absent"], ["a.parquet"])
         self.assertEqual(second["failed"], [])
+
+
+class SymlinkCleanupTests(unittest.TestCase):
+    """Cleanup must follow read paths through symlinks inside the data dir."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.data_dir = self.root / "data"
+        self.data_dir.mkdir()
+        self.manifest_path = self.root / "manifest.json"
+        self.db_path = self.root / "state" / "cleanup.db"
+        db.reset_initialization_cache()
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def settings(self) -> Settings:
+        return Settings(
+            manifest_path=self.manifest_path,
+            data_dir=self.data_dir,
+            db_path=self.db_path,
+            sample_data_dir=self.root / "samples",
+            seed_on_start=False,
+        )
+
+    def write_manifest(self, snapshots: list[dict]) -> None:
+        self.manifest_path.write_text(
+            json.dumps({"snapshots": snapshots}), encoding="utf-8"
+        )
+
+    def touch(self, *paths: str) -> None:
+        for relative in paths:
+            target = self.data_dir / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(b"PAR1-demo-PAR1")
+
+    def symlink(self, target: str, link: str) -> None:
+        link_path = self.data_dir / link
+        link_path.parent.mkdir(parents=True, exist_ok=True)
+        os.symlink(target, link_path)
+
+    def exists(self, relative: str) -> bool:
+        return (self.data_dir / relative).exists()
+
+    def lexists(self, relative: str) -> bool:
+        return os.path.lexists(self.data_dir / relative)
+
+    def test_directory_symlink_read_path_protects_real_file(self) -> None:
+        self.write_manifest(
+            [
+                {"snapshot_id": "new", "files": ["hydro/a.parquet"]},
+                {"snapshot_id": "legacy", "files": ["legacy/hydro/a.parquet"]},
+            ]
+        )
+        self.touch("hydro/a.parquet")
+        self.symlink("../hydro", "legacy/hydro")
+
+        # The retained snapshot reads through the directory symlink: the
+        # retired snapshot's manifest item resolves to the same real file
+        # and must be protected even though its path is unreferenced.
+        service.retire_snapshot(self.settings(), "new")
+        preview = service.preview_cleanup(self.settings())
+        self.assertEqual(preview["deletable"], [])
+        self.assertEqual(
+            preview["protected_by_symlink_aliases"], ["hydro/a.parquet"]
+        )
+        result = service.run_cleanup(self.settings())
+        self.assertEqual(result["deleted"], [])
+        self.assertTrue(self.exists("hydro/a.parquet"))
+
+        # Once the legacy reader is gone too, the file is reclaimed.
+        service.retire_snapshot(self.settings(), "legacy")
+        result = service.run_cleanup(self.settings())
+        self.assertEqual(result["deleted"], ["hydro/a.parquet"])
+        self.assertFalse(self.exists("hydro/a.parquet"))
+
+    def test_multi_level_chain_protects_intermediate_links(self) -> None:
+        self.write_manifest(
+            [
+                {"snapshot_id": "reader", "files": ["chain/l1.parquet"]},
+                {"snapshot_id": "old", "files": ["chain/l2.parquet", "real.parquet"]},
+            ]
+        )
+        self.touch("real.parquet")
+        self.symlink("../real.parquet", "chain/l2.parquet")
+        self.symlink("l2.parquet", "chain/l1.parquet")
+
+        # The retained snapshot reads l1 -> l2 -> real.parquet: both the
+        # intermediate link and the final target are protected.
+        service.retire_snapshot(self.settings(), "old")
+        preview = service.preview_cleanup(self.settings())
+        self.assertEqual(preview["deletable"], [])
+        self.assertEqual(
+            sorted(preview["protected_by_symlink_aliases"]),
+            ["chain/l2.parquet", "real.parquet"],
+        )
+        result = service.run_cleanup(self.settings())
+        self.assertEqual(result["deleted"], [])
+        self.assertTrue(self.lexists("chain/l2.parquet"))
+        self.assertTrue(self.exists("real.parquet"))
+
+        # After the reader retires, the whole chain is reclaimable.
+        service.retire_snapshot(self.settings(), "reader")
+        result = service.run_cleanup(self.settings())
+        self.assertEqual(
+            sorted(result["deleted"]),
+            ["chain/l1.parquet", "chain/l2.parquet", "real.parquet"],
+        )
+
+    def test_unused_alias_reclaimed_but_target_protected(self) -> None:
+        self.write_manifest(
+            [
+                {"snapshot_id": "live", "files": ["real.parquet"]},
+                {"snapshot_id": "old", "files": ["alias.parquet"]},
+            ]
+        )
+        self.touch("real.parquet")
+        self.symlink("real.parquet", "alias.parquet")
+
+        # The alias points at a protected file, but no read path uses the
+        # alias itself: unlinking it only removes the link.
+        service.retire_snapshot(self.settings(), "old")
+        preview = service.preview_cleanup(self.settings())
+        self.assertEqual(preview["deletable"], ["alias.parquet"])
+        self.assertEqual(preview["protected"], ["real.parquet"])
+        result = service.run_cleanup(self.settings())
+        self.assertEqual(result["deleted"], ["alias.parquet"])
+        self.assertFalse(self.lexists("alias.parquet"))
+        self.assertTrue(self.exists("real.parquet"))
+
+    def test_active_export_reading_old_paths_protects_targets(self) -> None:
+        self.write_manifest(
+            [
+                {"snapshot_id": "new", "files": ["hydro/a.parquet", "hydro/b.parquet"]},
+                {
+                    "snapshot_id": "legacy",
+                    "files": ["legacy/hydro/a.parquet", "links/b.parquet"],
+                },
+            ]
+        )
+        self.touch("hydro/a.parquet", "hydro/b.parquet")
+        self.symlink("../hydro", "legacy/hydro")
+        self.symlink("../hydro/b.parquet", "links/b.parquet")
+
+        registration = service.register_export(self.settings(), "legacy", "old-paths")
+        service.retire_snapshot(self.settings(), "new")
+        service.retire_snapshot(self.settings(), "legacy")
+
+        # The unfinished export reads via old paths: the real files behind
+        # the directory symlink and the file symlink stay protected.
+        preview = service.preview_cleanup(self.settings())
+        self.assertEqual(preview["deletable"], [])
+        self.assertEqual(
+            sorted(preview["protected_by_symlink_aliases"]),
+            ["hydro/a.parquet", "hydro/b.parquet"],
+        )
+        result = service.run_cleanup(self.settings())
+        self.assertEqual(result["deleted"], [])
+        self.assertTrue(self.exists("hydro/a.parquet"))
+        self.assertTrue(self.exists("hydro/b.parquet"))
+
+        # After release everything is reclaimable.  The legacy path resolves
+        # to the already-deleted real file and is reported absent.
+        service.release_export(self.settings(), registration["registration_id"])
+        result = service.run_cleanup(self.settings())
+        self.assertEqual(
+            result["deleted"], ["hydro/a.parquet", "hydro/b.parquet", "links/b.parquet"]
+        )
+        self.assertEqual(result["already_absent"], ["legacy/hydro/a.parquet"])
+
+    def test_escaping_symlink_chain_is_out_of_scope(self) -> None:
+        self.write_manifest(
+            [
+                {"snapshot_id": "reader", "files": ["esc.parquet"]},
+                {"snapshot_id": "old", "files": ["real.parquet", "out.parquet"]},
+            ]
+        )
+        self.touch("real.parquet")
+        self.symlink("/etc/hostname", "esc.parquet")
+        self.symlink("/etc/hostname", "out.parquet")
+        service.retire_snapshot(self.settings(), "old")
+
+        result = service.run_cleanup(self.settings())
+        # A read path whose chain leaves the data dir protects nothing, and
+        # path validation refuses to delete an item resolving outside.
+        self.assertEqual(result["deleted"], ["real.parquet"])
+        self.assertEqual(result["failed"], ["out.parquet"])
+        self.assertTrue(self.lexists("out.parquet"))
+
+    def test_delete_time_symlink_change_is_skipped(self) -> None:
+        self.touch("d1/a.parquet", "d2/a.parquet")
+        self.symlink("d1", "current")
+        root = self.data_dir.resolve()
+        planned = service._unlink_effect(root, "current/a.parquet")
+        self.assertEqual(planned, str(root / "d1" / "a.parquet"))
+
+        # The directory symlink is repointed mid-window: the item must not
+        # be unlinked at its new location.
+        os.remove(self.data_dir / "current")
+        self.symlink("d2", "current")
+        with self.assertRaises(ValueError):
+            service._ensure_still_reclaimable(
+                root, "current/a.parquet", planned, set()
+            )
+        self.assertTrue(self.exists("d2/a.parquet"))
+
+        # And an item that newly lands on a protected entry is skipped too.
+        with self.assertRaises(ValueError):
+            service._ensure_still_reclaimable(
+                root,
+                "current/a.parquet",
+                str(root / "d2" / "a.parquet"),
+                {str(root / "d2" / "a.parquet")},
+            )
+
+
+class SeedTests(unittest.TestCase):
+    def test_seed_recreates_symlinks_as_symlinks(self) -> None:
+        from app.seed import seed_sample_data
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sample = root / "sample"
+            (sample / "hydro").mkdir(parents=True)
+            (sample / "hydro" / "a.parquet").write_bytes(b"PAR1-PAR1")
+            (sample / "legacy").mkdir()
+            os.symlink("../hydro", sample / "legacy" / "hydro")
+            os.symlink("../hydro/a.parquet", sample / "legacy" / "a_link.parquet")
+
+            data = root / "data"
+            copied = seed_sample_data(sample, data)
+            self.assertEqual(copied, 3)
+            self.assertTrue((data / "hydro" / "a.parquet").is_file())
+            self.assertFalse((data / "hydro" / "a.parquet").is_symlink())
+            self.assertTrue((data / "legacy" / "hydro").is_symlink())
+            self.assertEqual(os.readlink(data / "legacy" / "hydro"), "../hydro")
+            self.assertTrue((data / "legacy" / "a_link.parquet").is_symlink())
+            # The recreated chain resolves to the seeded real file.
+            self.assertTrue((data / "legacy" / "a_link.parquet").exists())
+
+            # Seeding is a one-shot: the marker prevents re-copying.
+            self.assertEqual(seed_sample_data(sample, data), 0)
 
 
 class ManifestTests(unittest.TestCase):
