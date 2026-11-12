@@ -1,0 +1,29 @@
+services:
+  cleanup-api:
+    build: .
+    image: hydro-parquet-cleanup:local
+    ports:
+      - "8000:8000"
+    environment:
+      MANIFEST_PATH: /app/manifest.json
+      DATA_DIR: /app/data
+      CLEANUP_DB_PATH: /app/data/cleanup.db
+      SAMPLE_DATA_DIR: /app/sample_data
+      SEED_SAMPLE_DATA_ON_START: "1"
+    volumes:
+      # Sample Parquet files, the "seeded" marker and the SQLite DB all live
+      # on this volume, so deletions and retirement state survive restarts.
+      - cleanup-data:/app/data
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).read()"
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  cleanup-data:

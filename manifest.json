@@ -1,0 +1,28 @@
+{
+  "snapshots": [
+    {
+      "snapshot_id": "snap-20261101-night",
+      "files": [
+        "hydro/2026-11-01/station_a.parquet",
+        "hydro/2026-11-01/station_b.parquet",
+        "hydro/shared/quality.parquet"
+      ]
+    },
+    {
+      "snapshot_id": "snap-20261102-night",
+      "files": [
+        "hydro/2026-11-02/station_a.parquet",
+        "hydro/2026-11-02/station_b.parquet",
+        "hydro/shared/quality.parquet"
+      ]
+    },
+    {
+      "snapshot_id": "snap-20261102-noon",
+      "files": [
+        "hydro/2026-11-02/station_c.parquet",
+        "hydro/shared/quality.parquet",
+        "hydro/shared/station_meta.parquet"
+      ]
+    }
+  ]
+}
